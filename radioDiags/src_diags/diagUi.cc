@@ -15,12 +15,7 @@
 #include <iostream>
 
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <errno.h>
 
-#include <sys/select.h>
 #include <sys/time.h>
 
 #include "Radio.h"
@@ -28,6 +23,7 @@
 #include "FrequencySweeper.h"
 #include "diagUi.h"
 #include "console.h"
+#include "TcpServer.h"
 
 using namespace std;
 
@@ -56,12 +52,12 @@ typedef struct _commandEntry
 static char commandBuffer[200];
 static char lastCommandBuffer[200];
 bool diagUi_timeToExit;
-static pthread_t cliServerThread;
+static pthread_t userInterfaceThread;
 
 static console *consolePtr;
 static bool consoleConnected;
 static int connectFileDescriptor;
-static int diagUiNetworkPort;
+static TcpServer *networkInterfacePtr;
 
 // Default to normal dongle.
 static bool v4BlogRadio = false;
@@ -127,11 +123,6 @@ static void cmdSetLnaAgcThresholds(char *bufferPtr);
 static void cmdSetMixerAgcThresholds(char *bufferPtr);
 static void cmdExitSystem(char *bufferPtr);
 static void cmdHelp(void);
-
-/* network functions */
-static void startCliServer(void *arg);
-static void waitForCliConnection(int socketDescriptor);
-static void serviceCliConnection(void);
 
 // user interface thread entry point
 static void userInterfaceProcedure(void *arg);
@@ -203,6 +194,41 @@ static const commandEntry commandTable[] =
   {"\0","\0",0}                          // last entry in command table
 };
 
+/**************************************************************************
+
+  Name: connectCallback
+
+  Purpose: The purpose of this function is to handle remote connection
+  events from a TcpServer object.
+
+  Calling Sequence: connectCallback(socketDescripTor)
+
+  Inputs:
+
+    socketDescripTor - A file descriptor associated with the remote
+    connection.
+
+  Outputs:
+
+    None.
+
+**************************************************************************/
+static void connectCallback(int socketDescriptor)
+{
+
+
+  // These will be used by the console constructor.
+  connectFileDescriptor = socketDescriptor;
+  consoleConnected = true;
+
+  // Create the user interface thread.
+  pthread_create(&userInterfaceThread,0,
+                 (void *(*)(void *))userInterfaceProcedure,0);
+
+  return;
+
+} // connectCallback
+
 /*****************************************************************************
 
   Name: diagUi_start
@@ -227,15 +253,11 @@ void diagUi_start(int networkPort)
   // this stops nprintf() from sending data on a nonexistant connection  
   consolePtr = 0;
 
-  // save for later use
-  diagUiNetworkPort = networkPort;
-
   // allow things to run
   diagUi_timeToExit = false;
 
-  // create the user interface thread
-  pthread_create(&cliServerThread,0,
-                 (void *(*)(void *))startCliServer,0);
+  // Instiate a TCP server object.
+  networkInterfacePtr = new TcpServer(networkPort,connectCallback);
 
   return;
 
@@ -266,7 +288,10 @@ void diagUi_stop()
   diagUi_timeToExit = true;
 
   // we're done .. wait for the user interface thread to terminate
-  pthread_join(cliServerThread,0);
+  pthread_join(userInterfaceThread,0);
+
+  // We're done with this.
+  delete networkInterfacePtr;
 
   return;
 
@@ -2727,248 +2752,6 @@ void nprintf(FILE *s,const char *formatPtr, ...)
 
 /*****************************************************************************
 
-  Name: startCliServer
-
-  Purpose: The purpose of this function is to start the command line
-  interpreter server.  This is the entry point to the server thread.
-  This function listens on a TCP socket and waits for a connection
-  from a user.  When a connection is established, the user interface
-  thread is launched, and this function will block until the user
-  interface thread is terminated.  Once the user interface thread is
-  terminated, this function will close its half of the client connection
-  and will wait for a new connection.
-
-  Calling Sequence: startCliServer(arg)
-
-  Inputs:
-
-    arg - A pointer to an argument.
-
-  Outputs:
-
-    None.
-
-*****************************************************************************/
-static void startCliServer(void *arg)
-{
-  int status, option;
-  socklen_t clientAddressLength;
-  struct sockaddr_in addr;
-  int fileDescriptor;
-
-  // This is used for setting socket options.
-  option = 1;
-
-  // Create socket.
-  fileDescriptor = socket(PF_INET,SOCK_STREAM,0);
-
-  //*******************************************************************
-  // If the file descriptor is valid, a socket has been created.  Now
-  // we set up the parameters that are needed for the bind() call.
-  //*******************************************************************
-  if (fileDescriptor != -1)
-  {
-    // Set up to reuse the port number.
-    status = setsockopt(fileDescriptor,SOL_SOCKET,SO_REUSEADDR,
-        (char *)&option,sizeof(option));
-
-    if (status != -1)
-    {
-      // Set up the address structure.
-      bzero((char *)&addr,sizeof(addr));
-      addr.sin_family = AF_INET;
-      addr.sin_addr.s_addr = inet_addr("0.0.0.0");
-      addr.sin_port = htons(diagUiNetworkPort);
-
-      // Associate the address with the socket. 
-      status = bind(fileDescriptor,(struct sockaddr *)&addr,sizeof(addr));
-    } // if
-
-    if (status != -1)
-    {
-      // Accept only one connection.
-      status = listen(fileDescriptor,1);
-    } // if
-
-   /* This is needed needed by the accept() call. */
-    clientAddressLength = sizeof(addr);
-
-    //**********************************************************************
-    // This is the main server loop.  The server will block on the
-    // accept() call until a connection is made by a client.  Once a
-    // connection is established, the connection will be serviced, and no
-    // other processing will occur.  Note that this loop is traversed only
-    // once per connect/disconnect sequence, since this is an interative
-    // server that services only one client connection at a time.
-    //**********************************************************************
-    while (!diagUi_timeToExit)
-    {
-      // Indicate that there is no network connection.
-      consoleConnected = false;
-
-      // Wait until a client is attempting to connect.
-      waitForCliConnection(fileDescriptor);
-
-      if (!diagUi_timeToExit)
-      {
-        //************************************************************
-        // This block of code will accept the incoming connection.
-        // If the system call is interrupted for some reason, another
-        // attempt will be made to accept connections.
-        //************************************************************
-        do
-        {
-          // Accept the incoming connection.
-          connectFileDescriptor = 
-             accept(fileDescriptor,(sockaddr *)&addr,&clientAddressLength);
-
-          if (connectFileDescriptor == -1)
-          {
-            if (errno == EINTR)
-            {
-              continue;
-            } /* if */
-          } // if
-        } // do
-        while (connectFileDescriptor == -1);
-
-        // Do the appropriate processing for the new connection.
-        serviceCliConnection();
-
-        // We're done with this connection.
-        close (connectFileDescriptor);
-
-      } // if
-
-    } // while
-
-  } // if
-  else
-  {
-    // clean up the mess
-    close(fileDescriptor);
-  } // else
-
-  if (fileDescriptor != -1)
-  {
-    close(fileDescriptor);
-  } // if
-
-  pthread_exit(0);
-
-} // startCliServer
-
-/*****************************************************************************
-
-  Name: waitForCliConnection
-
-  Purpose: The purpose of this function is to wait for a client
-  connection.
-
-  Calling Sequence: waitForCliConnection(socketDescriptor)
-
-  Inputs:
-
-    socketDescriptor - A descriptor for the listener socket..
-
-  Outputs:
-
-    None.
-
-*****************************************************************************/
-static void waitForCliConnection(int socketDescriptor)
-{
-  bool done;
-  int status;
-  fd_set connectSet;
-  struct timeval timeout;
-
-  // Set up for loop entry.
-  done = false;
-
-  while ((!diagUi_timeToExit) && (!done))
-  {
-    // Ensure that we're clean.
-    FD_ZERO(&connectSet);
-
-    // Indicate the descriptor of interest.
-    FD_SET(socketDescriptor,&connectSet);
-
-    // Set timeout to 1 second.
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    // See which descriptors are available for reading.
-    status = select(socketDescriptor+1,&connectSet,0,0,&timeout);
-
-    if (status != -1)
-    {
-      if (FD_ISSET(socketDescriptor,&connectSet))
-      {
-        // Bail out.
-        done = true;
-      } // if
-    } // if
-  } // while
-
-  return;
-
-} // waitForCliConnection
-
-/*****************************************************************************
-
-  Name: serviceCliConnection
-
-  Purpose: The purpose of this function is to service a command line
-  interface user session.  The user interface thread is launched, and the
-  function will wait either on an indication of time to exit the system or
-  a network connection terminated by the link partner.
-
-  Calling Sequence: cliServer()
-
-  Inputs:
-
-    None.
-
-  Outputs:
-
-    None.
-
-*****************************************************************************/
-static void serviceCliConnection(void)
-{
-  struct timeval timeout;
-  pthread_t userInterfaceThread;
-
-  // Indicate that the console is connected.
-  consoleConnected = true;
-
-  // Create the user interface thread.
-  pthread_create(&userInterfaceThread,0,
-                 (void *(*)(void *))userInterfaceProcedure,0);
-
-  // Wait until either it is time to exit or the connection is dropped by
-  // the link partner.
-  while ((consoleConnected) &&
-         (!diagUi_timeToExit))
-  {
-    // Set up to block for 100ms.
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 100000;
-
-    // Wait for the designated time interval.
-    select(0,0,0,0,&timeout);
-  } // while
-
-  // Ok we're done .. wait for the user interface thread to terminate.
-  pthread_join(userInterfaceThread,0);
-
-  return;
-
-} // serviceCliConnection
-
-/*****************************************************************************
-
   Name: userInterfaceProcedure
 
   Purpose: The purpose of this function is to provide user interface
@@ -2994,11 +2777,10 @@ static void userInterfaceProcedure(void *arg)
   // create a console
   consolePtr = new console(connectFileDescriptor,
                                 &consoleConnected);
-
   // display introduction message
   nprintf(stderr,"\nWelcome to System Diagnostics\n");
 
-  while (!diagUi_timeToExit && consoleConnected)
+  while ((!diagUi_timeToExit) && (consoleConnected))
   {
     length = consolePtr->getLine(commandBuffer,80);
 
@@ -3018,11 +2800,10 @@ static void userInterfaceProcedure(void *arg)
       { // repeat last command
         decodeCommand(lastCommandBuffer);
       } // else
-
     } // if
   } // while */
 
-  // we don't need this anymore
+  networkInterfacePtr->peerDisconnected(); 
   delete consolePtr;
   consolePtr = 0;
 

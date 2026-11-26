@@ -24,6 +24,7 @@ CcFiles="\
     src_diags/console.cc \
     src_diags/diagUi.cc \
     src_diags/UdpClient.cc \
+    src_diags/TcpServer.cc \
     src_diags/MessageQueue.cc"
 
 Includes="\
