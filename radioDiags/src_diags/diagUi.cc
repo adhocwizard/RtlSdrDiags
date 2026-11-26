@@ -2774,9 +2774,10 @@ static void userInterfaceProcedure(void *arg)
   unsigned short length;
   unsigned short i;
 
-  // create a console
+  // Instatiate a console object.
   consolePtr = new console(connectFileDescriptor,
                                 &consoleConnected);
+
   // display introduction message
   nprintf(stderr,"\nWelcome to System Diagnostics\n");
 
@@ -2803,7 +2804,10 @@ static void userInterfaceProcedure(void *arg)
     } // if
   } // while */
 
+  // NOtify the TCP server of a link disconnection.
   networkInterfacePtr->peerDisconnected(); 
+
+  // Release resource.
   delete consolePtr;
   consolePtr = 0;
 
